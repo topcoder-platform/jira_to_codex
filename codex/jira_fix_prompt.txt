@@ -1,0 +1,105 @@
+You are working inside a project that contains a bunch of backend services and two UI apps - community app and platform-ui.  Platform-ui has many apps inside of it that route to subdomains
+
+Your task is to fix Jira issue {{KEY}}.
+
+================================================================================
+JIRA ISSUE
+================================================================================
+
+Key: {{KEY}}
+
+Summary:
+{{SUMMARY}}
+
+Description:
+{{DESCRIPTION}}
+
+================================================================================
+OBJECTIVE
+================================================================================
+
+Implement a correct, minimal fix for this issue.
+
+Follow these rules strictly:
+
+1. Keep changes scoped only to what is required to fix this ticket.
+2. Do NOT perform unrelated refactors.
+3. Do NOT reformat large unrelated files.
+4. Do NOT upgrade dependencies unless absolutely required for the fix.
+5. If the fix requires changes across multiple services (UI + API, etc.), that is allowed — but keep it tightly scoped.
+If you are uncertain about the correct behavior, infer it from existing tests and code patterns.
+Do not guess behavior without evidence from the repository.
+================================================================================
+TESTING & VALIDATION
+================================================================================
+
+You MUST:
+
+1. Run the project's test command(s) defined in AGENTS.md.
+2. Run lint/build commands defined in AGENTS.md.
+3. Ensure all tests pass.
+4. If there are no tests covering this bug, add an appropriate test when feasible.
+5. If the issue is UI-related and screenshots/videos were provided, ensure behavior matches the expected outcome.
+
+Do not skip validation steps.
+
+================================================================================
+IMPLEMENTATION GUIDELINES
+================================================================================
+
+- Prefer minimal diffs.
+- Follow the existing project conventions and patterns.
+- Reuse existing utilities where possible.
+- Avoid introducing new architectural patterns.
+- Avoid adding large dependencies.
+- Keep functions small and readable.
+- Preserve backward compatibility unless the ticket explicitly requires breaking change.
+
+================================================================================
+COMMIT REQUIREMENTS (MANDATORY)
+================================================================================
+
+You MUST:
+
+1. Ensure `git status` is clean except for the intended changes.
+2. Run `git fetch` to ensure we have the latest list of branches
+3. Create a new branch named "{{KEY}}".  If a "{{KEY}}" branch already exists, name the new branch "{{KEY}}-1", etc....
+2. Create EXACTLY ONE commit to the new branch
+3. Commit message MUST start with:
+
+   {{KEY}}: <short summary>
+
+4. After the summary line, include these sections as real multiline text:
+   - What was broken
+   - Root cause (if identifiable)
+   - What was changed
+   - Any added/updated tests
+
+   Formatting rules for both the commit message body and the PR description:
+   - Use actual newline characters. Do NOT include the literal characters "\n" or "\r\n".
+   - Do NOT pass a multiline body as a single quoted CLI argument with escaped newlines.
+   - Write the commit message and PR body to temporary files with a quoted heredoc, then use `git commit -F <file>` and `gh pr create --body-file <file>`.
+   - Verify the rendered commit message with `git log -1 --format=%B`.
+   - Verify the rendered PR body with `gh pr view --json body`.
+
+5. Push the new branch to Github
+6. Open a pull request from the new branch to either dev or develop, depending on which exists in the repo.  If both exist, use "dev".  The PR title should be {{KEY}}: <short summary>, and the description should be:
+   - What was broken
+   - Root cause (if identifiable)
+   - What was changed
+   - Any added/updated tests
+
+================================================================================
+FINAL STEP
+================================================================================
+
+After the steps above:
+
+1. Print a short summary including:
+   - Files modified
+   - Tests added/updated
+   - Commands run
+   - Confirmation that tests passed
+2. Confirm the commit message and PR description render with real line breaks rather than literal "\n" text.
+3. Add a comment to JIRA with the link to the Pull Request and the summary above.
+Stop after that.
