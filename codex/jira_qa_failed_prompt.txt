@@ -1,0 +1,28 @@
+================================================================================
+QA FAILED FOLLOW-UP
+================================================================================
+
+This Jira issue is currently in status `{{STATUS}}`.
+
+Treat this as a follow-up to an earlier attempted fix that did not pass QA.
+
+Before you make changes:
+
+1. Load the previous implementation attempts into context.
+   - Search git history, local branches, remote branches, and PR references for `{{KEY}}`.
+   - Find the branch that contains the earlier fix for this ticket and load that branch's changes into context before editing.
+   - Review the prior diffs/files so you understand exactly what was already changed.
+2. Read the most recent Jira comments first.
+   - The latest comments likely explain why QA rejected the previous fix.
+   - Use those comments to identify what is still broken, missing, or regressed.
+3. Investigate before patching.
+   - Confirm whether the prior fix was incomplete, incorrect, or introduced a regression.
+   - Keep any parts of the earlier fix that are correct, and only change what is needed.
+4. Create a new working branch for the follow-up fix.
+   - Do not reuse the old QA-failed branch as the final delivery branch.
+   - Start from the branch that contains the prior fix when that is the correct baseline, then create a fresh branch for the follow-up work.
+   - Name the new branch according to the standard ticket naming rules in the main prompt.
+5. In your final summary, explicitly state:
+   - what the previous fix attempted
+   - what QA reported as still wrong
+   - what you changed this time to address the remaining issues

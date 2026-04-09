@@ -53,6 +53,7 @@ Optional:
   REPO_DIR         legacy alias for PROJECT_ROOT
   BASE_BRANCH      default "main"
   PROMPT_TEMPLATE_PATH default "{script_dir}/codex/jira_fix_prompt.txt"
+  QA_FAILED_PROMPT_TEMPLATE_PATH default "{script_dir}/codex/jira_qa_failed_prompt.txt"
   IGNORE_LIST_PATH default "{script_dir}/ignore_list.txt"; one Jira issue key per line to skip
   JIRA_TO_CODEX_ENV_FILE path to a .env file to load before reading variables
   DRY_RUN          "1" or "0" (default "0")
@@ -220,6 +221,10 @@ PROMPT_TEMPLATE_PATH = os.environ.get(
     "PROMPT_TEMPLATE_PATH",
     str(SCRIPT_DIR / "codex" / "jira_fix_prompt.txt"),
 )
+QA_FAILED_PROMPT_TEMPLATE_PATH = os.environ.get(
+    "QA_FAILED_PROMPT_TEMPLATE_PATH",
+    str(SCRIPT_DIR / "codex" / "jira_qa_failed_prompt.txt"),
+)
 IGNORE_LIST_PATH = os.environ.get(
     "IGNORE_LIST_PATH",
     str(SCRIPT_DIR / "ignore_list.txt"),
@@ -276,6 +281,10 @@ class DownloadedAttachment:
     source: str  # e.g. "jira" or "video-frame:<video filename>"
 
 
+_WORKSPACE_REPO_CACHE: Optional[List[pathlib.Path]] = None
+_GH_PR_CHECK_WARNING_EMITTED = False
+
+
 # ----------------------------
 # Jira helpers
 # ----------------------------
@@ -305,7 +314,7 @@ def jira_search(jql: str, next_page_token: Optional[str] = None, max_results: in
     payload: Dict[str, Any] = {
         "jql": jql,
         "maxResults": max_results,
-        "fields": ["summary", "description", "labels", "attachment"],
+        "fields": ["summary", "description", "labels", "attachment", "status"],
     }
     if next_page_token:
         payload["nextPageToken"] = next_page_token
@@ -369,15 +378,35 @@ def extract_adf_text(adf_or_text: Any) -> str:
     return "".join(chunks).strip()
 
 
-def build_comments_block(issue_key: str, comments: List[Dict[str, Any]]) -> str:
+def build_comments_block(
+    issue_key: str,
+    comments: List[Dict[str, Any]],
+    *,
+    prioritize_recent: bool = False,
+) -> str:
+    """
+    Format Jira comments for the Codex prompt.
+
+    Parameters:
+      issue_key: Jira issue key used in the heading.
+      comments: Raw Jira comment payloads for the issue.
+      prioritize_recent: When True, newer comments are emitted first so QA
+        follow-up feedback is not truncated behind older discussion.
+
+    Returns:
+      A prompt-ready comment block, or an empty string when there is no usable
+      comment text within the configured limits.
+    """
     if not comments:
         return ""
 
-    out_lines = [f"Comments (Jira issue {issue_key}):"]
+    ordered_comments = list(reversed(comments)) if prioritize_recent else comments
+    header_suffix = ", newest first" if prioritize_recent else ""
+    out_lines = [f"Comments (Jira issue {issue_key}{header_suffix}):"]
     total_chars = 0
     included = 0
 
-    for c in comments[:MAX_COMMENTS_PER_ISSUE]:
+    for c in ordered_comments[:MAX_COMMENTS_PER_ISSUE]:
         author = ((c.get("author") or {}).get("displayName")) or "Unknown"
         created = c.get("created") or ""
         body = extract_adf_text(c.get("body"))
@@ -408,16 +437,42 @@ def run(cmd: List[str], cwd: Optional[str] = None, check: bool = True) -> subpro
     return subprocess.run(cmd, cwd=cwd, check=check, text=True, capture_output=True)
 
 
-def load_template() -> str:
-    with open(PROMPT_TEMPLATE_PATH, "r", encoding="utf-8") as f:
+def load_template(template_path: str = PROMPT_TEMPLATE_PATH) -> str:
+    """
+    Read a text prompt template from disk.
+
+    Parameters:
+      template_path: Absolute or relative path to the template file.
+
+    Returns:
+      The template contents as UTF-8 text.
+
+    Raises:
+      OSError: If the template cannot be opened.
+    """
+    with open(template_path, "r", encoding="utf-8") as f:
         return f.read()
 
 
-def fill_template(tpl: str, key: str, summary: str, description: str) -> str:
+def fill_template(tpl: str, key: str, summary: str, description: str, status: str) -> str:
+    """
+    Replace Jira placeholders in a prompt template.
+
+    Parameters:
+      tpl: Raw template text containing Jira placeholder tokens.
+      key: Jira issue key.
+      summary: Jira summary text.
+      description: Jira description text flattened to plain text.
+      status: Jira workflow status name.
+
+    Returns:
+      Template text with placeholders populated.
+    """
     return (
         tpl.replace("{{KEY}}", key)
         .replace("{{SUMMARY}}", summary or "")
         .replace("{{DESCRIPTION}}", description or "")
+        .replace("{{STATUS}}", status or "Unknown")
     )
 
 
@@ -438,6 +493,55 @@ def build_output_format_block() -> str:
         "- Before finishing, verify the commit body with `git log -1 --format=%B`.\n"
         "- After creating the PR, verify the PR body with `gh pr view --json body`.\n\n"
     )
+
+
+def extract_issue_status_name(fields: Dict[str, Any]) -> str:
+    """
+    Return the Jira status name from an issue fields payload.
+
+    Parameters:
+      fields: Jira issue fields returned by the search API.
+
+    Returns:
+      The human-readable status name, or an empty string when unavailable.
+    """
+    status = fields.get("status")
+    if isinstance(status, dict):
+        return str(status.get("name") or "").strip()
+    if isinstance(status, str):
+        return status.strip()
+    return ""
+
+
+def is_qa_failed_status(status_name: str) -> bool:
+    """
+    Determine whether a Jira status should trigger the QA-failed prompt path.
+
+    Parameters:
+      status_name: Human-readable Jira workflow status.
+
+    Returns:
+      True when the status is the QA follow-up state, otherwise False.
+    """
+    return status_name.casefold() == "qa failed"
+
+
+def build_status_guidance_block(issue_key: str, status_name: str) -> str:
+    """
+    Build any status-specific prompt guidance for the current Jira issue.
+
+    Parameters:
+      issue_key: Jira issue key used to fill prompt placeholders.
+      status_name: Human-readable Jira workflow status.
+
+    Returns:
+      A status-specific guidance block, or an empty string when the issue does
+      not require special handling.
+    """
+    if not is_qa_failed_status(status_name):
+        return ""
+    qa_template = load_template(QA_FAILED_PROMPT_TEMPLATE_PATH)
+    return fill_template(qa_template, issue_key, "", "", status_name).strip() + "\n\n"
 
 
 def load_ignore_list(ignore_list_path: str) -> set[str]:
@@ -484,6 +588,211 @@ def new_branch(issue_key: str) -> None:
         run(["git", "checkout", "-b", branch], cwd=REPO_DIR)
     else:
         run(["git", "checkout", branch], cwd=REPO_DIR)
+
+
+def is_git_repo_root(path: pathlib.Path) -> bool:
+    """
+    Check whether a path looks like the root of a git repository.
+
+    Parameters:
+      path: Directory path to inspect.
+
+    Returns:
+      True when the directory contains a `.git` entry, otherwise False.
+    """
+    return (path / ".git").exists()
+
+
+def workspace_repo_roots() -> List[pathlib.Path]:
+    """
+    Return the git repositories available under the configured project root.
+
+    Parameters:
+      None.
+
+    Returns:
+      Absolute repository root paths. If PROJECT_ROOT itself is a git repo, it
+      is returned as the only entry. Otherwise, immediate child repos are
+      returned in name order.
+    """
+    global _WORKSPACE_REPO_CACHE
+
+    if _WORKSPACE_REPO_CACHE is None:
+        if is_git_repo_root(PROJECT_ROOT):
+            _WORKSPACE_REPO_CACHE = [PROJECT_ROOT]
+        else:
+            repos: List[pathlib.Path] = []
+            try:
+                for child in sorted(PROJECT_ROOT.iterdir(), key=lambda item: item.name):
+                    if child.is_dir() and is_git_repo_root(child):
+                        repos.append(child)
+            except OSError:
+                repos = []
+            _WORKSPACE_REPO_CACHE = repos
+
+    return list(_WORKSPACE_REPO_CACHE)
+
+
+def resolve_repo_name_from_hint(hint: str, repo_names: List[str]) -> Optional[str]:
+    """
+    Match a focus hint or Jira label to a workspace repository name.
+
+    Parameters:
+      hint: Focus hint text derived from labels or folder mappings.
+      repo_names: Known repository folder names under PROJECT_ROOT.
+
+    Returns:
+      The matched repository folder name, or None when the hint does not map to
+      any known repo.
+    """
+    normalized = hint.strip()
+    if not normalized:
+        return None
+
+    normalized_path = normalized.replace("\\", "/")
+    first_segment = normalized_path.split("/", 1)[0]
+    if first_segment in repo_names:
+        return first_segment
+
+    for repo_name in sorted(repo_names, key=len, reverse=True):
+        if normalized == repo_name or normalized.startswith(f"{repo_name} "):
+            return repo_name
+
+    return None
+
+
+def resolve_target_repo_paths(labels: List[str], focus_paths: List[str]) -> List[pathlib.Path]:
+    """
+    Resolve candidate target repositories for a Jira issue.
+
+    Parameters:
+      labels: Jira labels on the current issue.
+      focus_paths: Focus hints already derived from LABEL_PATH_MAP.
+
+    Returns:
+      Candidate repository roots in priority order with duplicates removed.
+      When PROJECT_ROOT points directly at a single git repo, that repo is
+      returned as a fallback even if the hints do not resolve cleanly.
+    """
+    repo_roots = workspace_repo_roots()
+    if not repo_roots:
+        return []
+
+    repo_by_name = {repo_path.name: repo_path for repo_path in repo_roots}
+    repo_names = list(repo_by_name)
+    resolved: List[pathlib.Path] = []
+    seen: set[str] = set()
+
+    for hint in [*focus_paths, *labels]:
+        repo_name = resolve_repo_name_from_hint(hint, repo_names)
+        if not repo_name or repo_name in seen:
+            continue
+        resolved.append(repo_by_name[repo_name])
+        seen.add(repo_name)
+
+    if not resolved and len(repo_roots) == 1:
+        return list(repo_roots)
+
+    return resolved
+
+
+def search_open_pull_requests_for_issue(issue_key: str, repo_path: pathlib.Path) -> List[Dict[str, Any]]:
+    """
+    Search open pull requests in a repository for a Jira issue key.
+
+    Parameters:
+      issue_key: Jira issue key to search for.
+      repo_path: Absolute repository root to query with the GitHub CLI.
+
+    Returns:
+      Open pull request metadata dictionaries containing the JSON fields
+      returned by `gh pr list`. An empty list is returned when `gh` is missing,
+      the query fails, or there are no matching pull requests.
+    """
+    global _GH_PR_CHECK_WARNING_EMITTED
+
+    if shutil.which("gh") is None:
+        if not _GH_PR_CHECK_WARNING_EMITTED:
+            print("WARNING: gh is not installed; skipping open pull request pre-checks.")
+            _GH_PR_CHECK_WARNING_EMITTED = True
+        return []
+
+    result = run(
+        [
+            "gh",
+            "pr",
+            "list",
+            "--state",
+            "open",
+            "--search",
+            f'"{issue_key}" in:title',
+            "--limit",
+            "30",
+            "--json",
+            "number,title,url",
+        ],
+        cwd=str(repo_path),
+        check=False,
+    )
+    if result.returncode != 0:
+        stderr = (result.stderr or result.stdout or "").strip()
+        print(f"WARNING: Failed to query open pull requests in {repo_path.name}: {stderr}")
+        return []
+
+    try:
+        open_prs = json.loads(result.stdout or "[]")
+    except json.JSONDecodeError as exc:
+        print(f"WARNING: Failed to parse open pull requests in {repo_path.name}: {exc}")
+        return []
+
+    return open_prs if isinstance(open_prs, list) else []
+
+
+def issue_key_matches_pr_title(issue_key: str, title: str) -> bool:
+    """
+    Check whether a pull request title references the Jira issue key.
+
+    Parameters:
+      issue_key: Jira issue key such as `PM-4665`.
+      title: Pull request title to inspect.
+
+    Returns:
+      True when the title contains the issue key as a standalone token,
+      otherwise False.
+    """
+    pattern = re.compile(rf"(?<![A-Z0-9]){re.escape(issue_key)}(?![A-Z0-9])", re.IGNORECASE)
+    return bool(pattern.search(title or ""))
+
+
+def find_open_pull_requests_for_issue(issue_key: str, repo_paths: List[pathlib.Path]) -> List[Dict[str, Any]]:
+    """
+    Find open pull requests whose titles already reference a Jira issue key.
+
+    Parameters:
+      issue_key: Jira issue key to match in PR titles.
+      repo_paths: Candidate target repositories for the current issue.
+
+    Returns:
+      Matching pull request records including repo name, number, title, and URL.
+    """
+    matches: List[Dict[str, Any]] = []
+
+    for repo_path in repo_paths:
+        for pr in search_open_pull_requests_for_issue(issue_key, repo_path):
+            title = str(pr.get("title") or "")
+            if not issue_key_matches_pr_title(issue_key, title):
+                continue
+
+            matches.append(
+                {
+                    "repo_name": repo_path.name,
+                    "number": pr.get("number"),
+                    "title": title,
+                    "url": pr.get("url") or "",
+                }
+            )
+
+    return matches
 
 
 # ----------------------------
@@ -881,9 +1190,9 @@ def fetch_all_issues() -> List[Dict[str, Any]]:
 
 
 def main() -> None:
-    tpl: Optional[str] = None
+    tpl = load_template()
     if not DRY_RUN:
-        tpl = load_template()
+        pass
         #ensure_clean_git()
         #checkout_base()
 
@@ -915,19 +1224,36 @@ def main() -> None:
             continue
 
         description = extract_adf_text(fields.get("description"))
+        status_name = extract_issue_status_name(fields) or "Unknown"
+        qa_failed = is_qa_failed_status(status_name)
         labels = fields.get("labels", []) or []
         attachments = fields.get("attachment", []) or []
 
         focus_paths = label_to_paths(labels)
+        target_repo_paths = resolve_target_repo_paths(labels, focus_paths)
+        existing_prs = find_open_pull_requests_for_issue(key, target_repo_paths)
         focus_block = build_focus_block(labels, focus_paths)
+        status_guidance_block = build_status_guidance_block(key, status_name)
 
         print("\n" + "=" * 80)
         print(f"[{idx}/{len(issues)}] {key} - {summary}")
+        print(f"Status: {status_name}")
         if labels:
             print(f"Labels: {', '.join(labels)}")
         if focus_paths:
             print(f"Focus paths: {', '.join(focus_paths)}")
+        if target_repo_paths:
+            print(f"Target repos: {', '.join(repo_path.name for repo_path in target_repo_paths)}")
+        if qa_failed:
+            print("Prompt mode: QA Failed follow-up")
         print(f"Jira attachments: {len(attachments)}")
+        if existing_prs:
+            print("Open pull requests already exist for this ticket:")
+            for pr in existing_prs:
+                print(f"- {pr['repo_name']} #{pr['number']}: {pr['title']} -> {pr['url']}")
+            print(f"SKIPPING {key} DUE TO EXISTING OPEN PULL REQUEST.")
+            print("=" * 80)
+            continue
         print("=" * 80)
 
         # Attachments (download + optional video frame extraction)
@@ -958,7 +1284,7 @@ def main() -> None:
         if INCLUDE_COMMENTS_IN_PROMPT:
             try:
                 comments = jira_get_all_comments(key, max_results=100)
-                comments_block = build_comments_block(key, comments)
+                comments_block = build_comments_block(key, comments, prioritize_recent=qa_failed)
                 print(f"Fetched comments: {len(comments)}")
             except Exception as e:
                 print(f"WARNING: Failed to fetch comments for {key}: {e}")
@@ -969,6 +1295,7 @@ def main() -> None:
         if DRY_RUN:
             print("\nPrompt additions preview (truncated by limits):")
             print((focus_block or "(no focus block)").rstrip())
+            print((status_guidance_block or "(no status guidance block)").rstrip())
             if INCLUDE_ATTACHMENTS_IN_PROMPT:
                 print((attachments_block or "(no attachments block)").rstrip())
             if INCLUDE_COMMENTS_IN_PROMPT:
@@ -976,14 +1303,12 @@ def main() -> None:
             continue
 
         # LIVE MODE: git + codex
-        assert tpl is not None
-
         #checkout_base()
         #new_branch(key)
 
-        prompt = fill_template(tpl, key, summary, description)
+        prompt = fill_template(tpl, key, summary, description, status_name)
         format_block = build_output_format_block() if STRICT_MULTILINE_FORMATTING else ""
-        prompt = format_block + focus_block + attachments_block + comments_block + prompt
+        prompt = format_block + focus_block + status_guidance_block + attachments_block + comments_block + prompt
 
         codex_fix(prompt, image_paths=image_paths)
 

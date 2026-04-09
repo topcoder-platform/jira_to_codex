@@ -85,6 +85,7 @@ The launchers load configuration from a repo-local `.env` file.
 - `DRY_RUN_JQL`: Query used by `jira_dry_run.sh` or any run where `DRY_RUN=1`.
 - `LABEL_PATH_MAP`: JSON map from Jira labels to likely repo folders or app areas.
 - `STRICT_MULTILINE_FORMATTING`: Keeps Codex from generating commit or PR bodies that contain literal `\n` text.
+- `QA_FAILED_PROMPT_TEMPLATE_PATH`: Optional override for the status-specific prompt used when a Jira issue is in `QA Failed`.
 - `POST_CHECK_CMD`: Optional command that runs after Codex finishes.
 
 The Python runner also accepts a legacy `REPO_DIR` environment variable, but `PROJECT_ROOT` is now the preferred name.
@@ -108,10 +109,12 @@ When the dry-run output looks correct, run the live flow:
 The live run will:
 
 1. Query Jira for issues assigned to you.
-2. Download attachments and comments.
-3. Build a focused prompt using `codex/jira_fix_prompt.txt`.
-4. Run `codex exec` in `PROJECT_ROOT`.
-5. Let Codex create a branch, commit, push, open a PR, and comment back on the Jira ticket.
+2. Resolve likely target repos from `LABEL_PATH_MAP` and skip any issue that already has an open PR in one of those repos whose title contains the Jira key.
+3. Download attachments and comments.
+4. Build a focused prompt using `codex/jira_fix_prompt.txt`.
+5. If the Jira status is `QA Failed`, prepend a follow-up prompt that tells Codex to inspect the previous fix branch, investigate the latest QA comments, and create a fresh branch for the follow-up work.
+6. Run `codex exec` in `PROJECT_ROOT`.
+7. Let Codex create a branch, commit, push, open a PR, and comment back on the Jira ticket.
 
 ## Running Python Directly
 

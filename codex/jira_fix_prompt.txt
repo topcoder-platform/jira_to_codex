@@ -8,6 +8,8 @@ JIRA ISSUE
 
 Key: {{KEY}}
 
+Status: {{STATUS}}
+
 Summary:
 {{SUMMARY}}
 
